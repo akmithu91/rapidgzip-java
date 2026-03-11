@@ -1,0 +1,6 @@
+target/
+native/build/
+src/main/resources/native/
+.idea/
+*.iml
+.vscode/
