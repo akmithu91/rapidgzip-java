@@ -29,6 +29,8 @@ public class RapidGzipInputStream extends InputStream {
     private final MemorySegment handle;
     private final MemorySegment nativeBuf;
     private final int nativeBufSize;
+    private int stagedPos;
+    private int stagedLimit;
     private boolean closed;
 
     /**
@@ -63,6 +65,8 @@ public class RapidGzipInputStream extends InputStream {
         this.nativeBufSize = nativeBufSize;
         this.nativeBuf = arena.allocate(nativeBufSize);
         this.handle = RapidGzipNative.open(arena, path, parallelism, chunkSize);
+        this.stagedPos = 0;
+        this.stagedLimit = 0;
         this.closed = false;
     }
 
@@ -78,16 +82,24 @@ public class RapidGzipInputStream extends InputStream {
         if (closed) throw new IOException("Stream closed");
         if (len == 0) return 0;
 
+        MemorySegment target = MemorySegment.ofArray(b);
         int totalRead = 0;
         while (totalRead < len) {
-            int toRead = Math.min(len - totalRead, nativeBufSize);
-            long n = RapidGzipNative.read(handle, nativeBuf, toRead);
-            if (n == 0) {
-                return totalRead == 0 ? -1 : totalRead;
+            if (stagedPos >= stagedLimit) {
+                long n = RapidGzipNative.read(handle, nativeBuf, nativeBufSize);
+                if (n == 0) {
+                    return totalRead == 0 ? -1 : totalRead;
+                }
+                stagedPos = 0;
+                stagedLimit = (int) n;
             }
+
+            int available = stagedLimit - stagedPos;
+            int toCopy = Math.min(len - totalRead, available);
             // Copy from native buffer to Java byte array
-            MemorySegment.copy(nativeBuf, 0, MemorySegment.ofArray(b), off + totalRead, n);
-            totalRead += (int) n;
+            MemorySegment.copy(nativeBuf, stagedPos, target, off + totalRead, toCopy);
+            stagedPos += toCopy;
+            totalRead += toCopy;
         }
         return totalRead;
     }

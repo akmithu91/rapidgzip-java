@@ -6,6 +6,7 @@ import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.Spliterator;
@@ -51,6 +52,13 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
 
     private final RapidGzipInputStream gzipStream;
     private final BufferedReader bufferedReader;
+    private final boolean fastUtf8;
+    private final byte[] readBuffer;
+    private byte[] lineBuffer;
+    private int readPos;
+    private int readLimit;
+    private int lineLength;
+    private boolean eof;
     private boolean closed;
 
     /**
@@ -82,8 +90,26 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
      */
     public RapidGzipLineReader(String path, int parallelism, Charset charset, int javaBufferSize) {
         this.gzipStream = new RapidGzipInputStream(path, parallelism);
-        this.bufferedReader = new BufferedReader(
-                new InputStreamReader(gzipStream, charset), javaBufferSize);
+        this.fastUtf8 = StandardCharsets.UTF_8.equals(charset);
+        if (fastUtf8) {
+            int byteBufferSize = Math.max(1 << 20, javaBufferSize);
+            this.readBuffer = new byte[byteBufferSize];
+            this.lineBuffer = new byte[Math.max(1024, javaBufferSize)];
+            this.bufferedReader = null;
+            this.readPos = 0;
+            this.readLimit = 0;
+            this.lineLength = 0;
+            this.eof = false;
+        } else {
+            this.bufferedReader = new BufferedReader(
+                    new InputStreamReader(gzipStream, charset), javaBufferSize);
+            this.readBuffer = null;
+            this.lineBuffer = null;
+            this.readPos = 0;
+            this.readLimit = 0;
+            this.lineLength = 0;
+            this.eof = false;
+        }
         this.closed = false;
     }
 
@@ -91,7 +117,83 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
      * Read the next line, or {@code null} if EOF.
      */
     public String readLine() throws IOException {
+        if (fastUtf8) {
+            return readLineUtf8();
+        }
         return bufferedReader.readLine();
+    }
+
+    private String readLineUtf8() throws IOException {
+        while (true) {
+            if (readPos >= readLimit) {
+                if (eof) {
+                    if (lineLength == 0) {
+                        return null;
+                    }
+                    if (lineBuffer[lineLength - 1] == '\r') {
+                        lineLength--;
+                    }
+                    String lastLine = new String(lineBuffer, 0, lineLength, StandardCharsets.UTF_8);
+                    lineLength = 0;
+                    return lastLine;
+                }
+
+                int n = gzipStream.read(readBuffer, 0, readBuffer.length);
+                if (n == -1) {
+                    eof = true;
+                    continue;
+                }
+                readPos = 0;
+                readLimit = n;
+            }
+
+            int lineEnd = readPos;
+            while (lineEnd < readLimit && readBuffer[lineEnd] != '\n') {
+                lineEnd++;
+            }
+
+            if (lineEnd < readLimit) {
+                int chunkLength = lineEnd - readPos;
+                if (lineLength == 0) {
+                    int end = chunkLength;
+                    if (end > 0 && readBuffer[readPos + end - 1] == '\r') {
+                        end--;
+                    }
+                    String line = new String(readBuffer, readPos, end, StandardCharsets.UTF_8);
+                    readPos = lineEnd + 1;
+                    return line;
+                }
+
+                appendReadSlice(readPos, chunkLength);
+                if (lineLength > 0 && lineBuffer[lineLength - 1] == '\r') {
+                    lineLength--;
+                }
+                String line = new String(lineBuffer, 0, lineLength, StandardCharsets.UTF_8);
+                lineLength = 0;
+                readPos = lineEnd + 1;
+                return line;
+            }
+
+            appendReadSlice(readPos, readLimit - readPos);
+            readPos = readLimit;
+        }
+    }
+
+    private void appendReadSlice(int start, int length) {
+        if (length <= 0) {
+            return;
+        }
+        ensureLineCapacity(lineLength + length);
+        System.arraycopy(readBuffer, start, lineBuffer, lineLength, length);
+        lineLength += length;
+    }
+
+    private void ensureLineCapacity(int requiredSize) {
+        if (requiredSize <= lineBuffer.length) {
+            return;
+        }
+        int newSize = Math.max(requiredSize, lineBuffer.length << 1);
+        lineBuffer = Arrays.copyOf(lineBuffer, newSize);
     }
 
     /**
@@ -110,7 +212,7 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
      */
     public void forEachLine(Consumer<String> action) throws IOException {
         String line;
-        while ((line = bufferedReader.readLine()) != null) {
+        while ((line = readLine()) != null) {
             action.accept(line);
         }
     }
@@ -133,7 +235,7 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
                 if (done) return false;
                 if (next != null) return true;
                 try {
-                    next = bufferedReader.readLine();
+                    next = readLine();
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
@@ -158,7 +260,11 @@ public class RapidGzipLineReader implements AutoCloseable, Iterable<String> {
     public void close() throws IOException {
         if (!closed) {
             closed = true;
-            bufferedReader.close(); // closes underlying streams
+            if (bufferedReader != null) {
+                bufferedReader.close(); // closes underlying streams
+            } else {
+                gzipStream.close();
+            }
         }
     }
 }
