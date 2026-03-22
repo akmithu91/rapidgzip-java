@@ -59,7 +59,7 @@ public class RapidGzipInputStream extends InputStream {
      * @param nativeBufSize size of the native read buffer
      */
     public RapidGzipInputStream(String path, int parallelism, long chunkSize, int nativeBufSize) {
-        this.arena = Arena.ofConfined();
+        this.arena = Arena.ofShared();
         this.nativeBufSize = nativeBufSize;
         this.nativeBuf = arena.allocate(nativeBufSize);
         this.handle = RapidGzipNative.open(arena, path, parallelism, chunkSize);
